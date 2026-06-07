@@ -9,25 +9,38 @@
 """A modern cross-platform image viewer.
 
 Run with:
-    ./pxl.py [image | directory]
-    ./pxl.py --mode thumbnails directory
-    ./pxl.py --mode slideshow --interval 5 directory
-
-or:
     uv run --script pxl.py [image | directory]
+    uv run --script pxl.py --mode thumbnails directory
+    uv run --script pxl.py --mode slideshow --interval 5 directory
+
+On Windows, build pxl.exe with:
+    ./scripts/build-windows.ps1
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
 import sys
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from PIL import Image, UnidentifiedImageError
-from PySide6.QtCore import QCoreApplication, QEvent, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QObject,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -63,10 +76,14 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "pxl"
 APP_VERSION = "0.1.0"
+APP_USER_MODEL_ID = "io.github.shuic.pxl"
 DEFAULT_SLIDESHOW_INTERVAL = 3.0
 THUMBNAIL_SIZE = 176
 THUMBNAIL_ITEM_WIDTH = 220
 THUMBNAIL_ITEM_HEIGHT = 238
+LOAD_CACHE_SIZE = 5
+THUMBNAIL_BATCH_SIZE = 32
+THUMBNAIL_PRIORITY_FALLBACK_COUNT = 64
 VALID_MODES = ("image", "thumbnails", "slideshow")
 Image.init()
 SUPPORTED_EXTENSIONS = frozenset(
@@ -116,7 +133,7 @@ class LoadedImage:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="pxl.py",
+        prog=APP_NAME,
         description="Open and inspect Pillow-readable images in a modern PySide6 viewer.",
     )
     parser.add_argument(
@@ -140,13 +157,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def is_supported_image(path: Path) -> bool:
-    try:
-        with Image.open(path) as image:
-            image.verify()
-    except IMAGE_OPEN_ERRORS:
-        return False
-    return True
+def has_supported_extension(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
 def image_dialog_filter() -> str:
@@ -164,10 +176,26 @@ def normalized_path(path: Path) -> Path:
     return path.resolve()
 
 
-def same_folder_images(path: Path) -> list[Path]:
-    if not path.parent.exists():
-        return [path]
-    return directory_images(path.parent)
+def resource_path(*parts: str) -> Path:
+    return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+def app_icon() -> QIcon:
+    icon_path = resource_path("assets", "pxl.ico")
+    if icon_path.exists():
+        return QIcon(str(icon_path))
+    return QIcon()
+
+
+def configure_windows_app_identity() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            APP_USER_MODEL_ID
+        )
+    except (AttributeError, OSError):
+        pass
 
 
 def directory_images(path: Path) -> list[Path]:
@@ -175,7 +203,7 @@ def directory_images(path: Path) -> list[Path]:
         (
             candidate
             for candidate in path.iterdir()
-            if candidate.is_file() and is_supported_image(candidate)
+            if candidate.is_file() and has_supported_extension(candidate)
         ),
         key=lambda candidate: candidate.name.casefold(),
     )
@@ -293,6 +321,54 @@ def pil_to_pixmap(image: Image.Image) -> QPixmap:
     return QPixmap.fromImage(pil_to_qimage(image))
 
 
+class ImageLoadSignals(QObject):
+    loaded = Signal(object, object)
+    failed = Signal(object, object)
+
+
+class ImageLoadWorker(QRunnable):
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = ImageLoadSignals()
+
+    def run(self) -> None:
+        try:
+            loaded = load_image(self.path)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.failed.emit(self.path, exc)
+            return
+        self.signals.loaded.emit(loaded.path, loaded)
+
+
+class ThumbnailSignals(QObject):
+    loaded = Signal(int, object, object)
+    failed = Signal(int, object, object)
+
+
+class ThumbnailWorker(QRunnable):
+    def __init__(
+        self,
+        generation: int,
+        path: Path,
+        checkerboard_enabled: bool,
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.path = path
+        self.checkerboard_enabled = checkerboard_enabled
+        self.signals = ThumbnailSignals()
+
+    def run(self) -> None:
+        try:
+            image = thumbnail_image(self.path, self.checkerboard_enabled)
+            qimage = pil_to_qimage(image)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.failed.emit(self.generation, self.path, exc)
+            return
+        self.signals.loaded.emit(self.generation, self.path, qimage)
+
+
 class ImageView(QGraphicsView):
     def __init__(self) -> None:
         super().__init__()
@@ -394,6 +470,10 @@ class ImageView(QGraphicsView):
 class ThumbnailGrid(QListWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.path_items: dict[str, QListWidgetItem] = {}
+        self.placeholder_icon = self._solid_icon("#171d26")
+        self.error_icon = self._solid_icon("#4a2525")
+
         self.setViewMode(QListWidget.ViewMode.IconMode)
         self.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.setMovement(QListWidget.Movement.Static)
@@ -407,23 +487,61 @@ class ThumbnailGrid(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setWordWrap(True)
 
+    def _solid_icon(self, color: str) -> QIcon:
+        pixmap = QPixmap(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+        pixmap.fill(QColor(color))
+        return QIcon(pixmap)
+
     def set_images(
         self,
         paths: list[Path],
         current_path: Path | None,
-        checkerboard_enabled: bool,
     ) -> None:
         self.clear()
+        self.path_items.clear()
         for path in paths:
-            pixmap = pil_to_pixmap(thumbnail_image(path, checkerboard_enabled))
-            item = QListWidgetItem(QIcon(pixmap), path.name)
+            path_key = str(path)
+            item = QListWidgetItem(self.placeholder_icon, path.name)
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(str(path))
             item.setSizeHint(QSize(THUMBNAIL_ITEM_WIDTH, THUMBNAIL_ITEM_HEIGHT))
             self.addItem(item)
+            self.path_items[path_key] = item
             if current_path == path:
                 item.setSelected(True)
                 self.setCurrentItem(item)
+
+    def set_thumbnail(self, path: Path, qimage: QImage) -> None:
+        item = self.path_items.get(str(path))
+        if item is None:
+            return
+        item.setIcon(QIcon(QPixmap.fromImage(qimage)))
+
+    def set_thumbnail_error(self, path: Path) -> None:
+        item = self.path_items.get(str(path))
+        if item is None:
+            return
+        item.setIcon(self.error_icon)
+
+    def visible_paths(self) -> list[Path]:
+        viewport_rect = self.viewport().rect()
+        paths: list[Path] = []
+        for index in range(self.count()):
+            item = self.item(index)
+            if not self.visualItemRect(item).intersects(viewport_rect):
+                continue
+            value = item.data(Qt.ItemDataRole.UserRole)
+            if value:
+                paths.append(Path(value))
+        return paths
+
+    def first_paths(self, limit: int) -> list[Path]:
+        paths: list[Path] = []
+        for index in range(min(limit, self.count())):
+            value = self.item(index).data(Qt.ItemDataRole.UserRole)
+            if value:
+                paths.append(Path(value))
+        return paths
 
 
 class PxlViewer(QMainWindow):
@@ -437,17 +555,33 @@ class PxlViewer(QMainWindow):
         self.mode = "image"
         self.initial_mode = initial_mode
         self.current_path: Path | None = None
+        self.image_folder: Path | None = None
         self.image_paths: list[Path] = []
         self.loaded: LoadedImage | None = None
+        self.loaded_cache: OrderedDict[Path, LoadedImage] = OrderedDict()
+        self.prefetching_paths: set[Path] = set()
+        self.thumbnail_generation = 0
+        self.thumbnail_queue: deque[Path] = deque()
         self.checkerboard_enabled = True
         self.slideshow_paused = False
         self.presentation_chrome_enabled = False
         self.presentation_cursor_hidden = False
         self.fullscreen_return_mode: str | None = None
 
+        self.prefetch_pool = QThreadPool()
+        self.prefetch_pool.setMaxThreadCount(2)
+        self.thumbnail_pool = QThreadPool()
+        self.thumbnail_pool.setMaxThreadCount(
+            max(2, min(4, QThreadPool.globalInstance().maxThreadCount()))
+        )
+
         self.slideshow_timer = QTimer(self)
         self.slideshow_timer.setInterval(max(500, int(slideshow_interval * 1000)))
         self.slideshow_timer.timeout.connect(self.advance_slideshow)
+
+        self.thumbnail_timer = QTimer(self)
+        self.thumbnail_timer.setInterval(0)
+        self.thumbnail_timer.timeout.connect(self.enqueue_thumbnail_batch)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1120, 780)
@@ -535,6 +669,9 @@ class PxlViewer(QMainWindow):
         self.thumbnail_grid = ThumbnailGrid()
         self.thumbnail_grid.itemClicked.connect(self.open_thumbnail_item)
         self.thumbnail_grid.itemActivated.connect(self.open_thumbnail_item)
+        self.thumbnail_grid.verticalScrollBar().valueChanged.connect(
+            self.prioritize_visible_thumbnails
+        )
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.image_view)
@@ -654,6 +791,155 @@ class PxlViewer(QMainWindow):
         painter.end()
         return QIcon(pixmap)
 
+    def cached_directory_images(self, folder: Path, force: bool = False) -> list[Path]:
+        folder = normalized_path(folder)
+        if force or self.image_folder != folder:
+            self.image_paths = directory_images(folder)
+            self.image_folder = folder
+        return self.image_paths
+
+    def update_image_list_for_path(self, path: Path, force: bool = False) -> None:
+        folder = path.parent
+        if not folder.exists():
+            self.image_folder = folder
+            self.image_paths = [path]
+            return
+
+        try:
+            images = self.cached_directory_images(folder, force=force)
+        except OSError:
+            self.image_folder = folder
+            self.image_paths = [path]
+            return
+
+        if path not in images:
+            self.image_paths = [*images, path]
+
+    def cached_loaded_image(self, path: Path, force: bool = False) -> LoadedImage:
+        path = normalized_path(path)
+        if not force and path in self.loaded_cache:
+            loaded = self.loaded_cache.pop(path)
+            self.loaded_cache[path] = loaded
+            return loaded
+
+        loaded = load_image(path)
+        self.cache_loaded_image(loaded)
+        return loaded
+
+    def cache_loaded_image(self, loaded: LoadedImage) -> None:
+        path = loaded.path
+        if path in self.loaded_cache:
+            self.loaded_cache.pop(path)
+        self.loaded_cache[path] = loaded
+        while len(self.loaded_cache) > LOAD_CACHE_SIZE:
+            self.loaded_cache.popitem(last=False)
+
+    def prefetch_neighbors(self) -> None:
+        if not self.current_path or len(self.image_paths) < 2:
+            return
+        try:
+            current_index = self.image_paths.index(self.current_path)
+        except ValueError:
+            return
+
+        candidate_indexes = {
+            (current_index - 1) % len(self.image_paths),
+            (current_index + 1) % len(self.image_paths),
+        }
+        for index in candidate_indexes:
+            path = self.image_paths[index]
+            if path == self.current_path:
+                continue
+            if path in self.loaded_cache or path in self.prefetching_paths:
+                continue
+            self.prefetching_paths.add(path)
+            worker = ImageLoadWorker(path)
+            worker.signals.loaded.connect(self.handle_prefetched_image)
+            worker.signals.failed.connect(self.handle_prefetch_failed)
+            self.prefetch_pool.start(worker)
+
+    def handle_prefetched_image(self, path: Path, loaded: LoadedImage) -> None:
+        self.prefetching_paths.discard(path)
+        self.cache_loaded_image(loaded)
+
+    def handle_prefetch_failed(self, path: Path, _exc: Exception) -> None:
+        self.prefetching_paths.discard(path)
+
+    def ordered_thumbnail_paths(self) -> list[Path]:
+        visible_paths = self.thumbnail_grid.visible_paths()
+        if not visible_paths:
+            visible_paths = self.thumbnail_grid.first_paths(
+                THUMBNAIL_PRIORITY_FALLBACK_COUNT
+            )
+        visible_set = set(visible_paths)
+        return [
+            *visible_paths,
+            *(path for path in self.image_paths if path not in visible_set),
+        ]
+
+    def start_thumbnail_generation(self, generation: int) -> None:
+        if generation != self.thumbnail_generation:
+            return
+        self.thumbnail_pool.clear()
+        self.thumbnail_queue = deque(self.ordered_thumbnail_paths())
+        self.enqueue_thumbnail_batch()
+        if self.thumbnail_queue:
+            self.thumbnail_timer.start()
+
+    def enqueue_thumbnail_batch(self) -> None:
+        if not self.thumbnail_queue:
+            self.thumbnail_timer.stop()
+            return
+
+        generation = self.thumbnail_generation
+        for _ in range(min(THUMBNAIL_BATCH_SIZE, len(self.thumbnail_queue))):
+            path = self.thumbnail_queue.popleft()
+            worker = ThumbnailWorker(generation, path, self.checkerboard_enabled)
+            worker.signals.loaded.connect(self.handle_thumbnail_loaded)
+            worker.signals.failed.connect(self.handle_thumbnail_failed)
+            self.thumbnail_pool.start(worker)
+
+        if not self.thumbnail_queue:
+            self.thumbnail_timer.stop()
+
+    def prioritize_visible_thumbnails(self) -> None:
+        if not self.thumbnail_queue:
+            return
+        visible_paths = self.thumbnail_grid.visible_paths()
+        if not visible_paths:
+            return
+
+        queued = set(self.thumbnail_queue)
+        priority_paths = [path for path in visible_paths if path in queued]
+        if not priority_paths:
+            return
+
+        priority_set = set(priority_paths)
+        remaining_paths = [
+            path for path in self.thumbnail_queue if path not in priority_set
+        ]
+        self.thumbnail_queue = deque([*priority_paths, *remaining_paths])
+
+    def handle_thumbnail_loaded(
+        self,
+        generation: int,
+        path: Path,
+        qimage: QImage,
+    ) -> None:
+        if generation != self.thumbnail_generation:
+            return
+        self.thumbnail_grid.set_thumbnail(path, qimage)
+
+    def handle_thumbnail_failed(
+        self,
+        generation: int,
+        path: Path,
+        _exc: Exception,
+    ) -> None:
+        if generation != self.thumbnail_generation:
+            return
+        self.thumbnail_grid.set_thumbnail_error(path)
+
     def open_file_dialog(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
             self,
@@ -687,11 +973,11 @@ class PxlViewer(QMainWindow):
         if path.is_dir():
             self.open_directory(path)
             return
-        self.open_path(path)
+        self.open_path(path, refresh_folder=True)
 
     def open_directory(self, path: Path) -> None:
         try:
-            images = directory_images(path)
+            images = self.cached_directory_images(path, force=True)
         except OSError as exc:
             self.report_error("Open failed", f"Could not read directory:\n{path}\n\n{exc}")
             return
@@ -699,36 +985,58 @@ class PxlViewer(QMainWindow):
         if not images:
             self.report_error(
                 "No images",
-                f"No Pillow-readable images found in:\n{path}",
+                f"No supported image files found in:\n{path}",
             )
             return
 
-        self.image_paths = images
-        self.open_path(images[0])
+        for image_path in images:
+            if self.open_path(image_path, show_errors=False):
+                return
 
-    def open_path(self, path: Path) -> None:
+        self.report_error(
+            "No images",
+            f"No readable image files found in:\n{path}",
+        )
+
+    def open_path(
+        self,
+        path: Path,
+        *,
+        refresh_folder: bool = False,
+        force_load: bool = False,
+        show_errors: bool = True,
+    ) -> bool:
         path = normalized_path(path)
         try:
-            loaded = load_image(path)
+            loaded = self.cached_loaded_image(path, force=force_load)
         except FileNotFoundError:
-            self.report_error("File not found", f"Could not find:\n{path}")
-            return
+            if show_errors:
+                self.report_error("File not found", f"Could not find:\n{path}")
+            return False
         except UnidentifiedImageError:
-            self.report_error("Unsupported image", f"Could not open as an image:\n{path}")
-            return
+            if show_errors:
+                self.report_error(
+                    "Unsupported image",
+                    f"Could not open as an image:\n{path}",
+                )
+            return False
         except IMAGE_OPEN_ERRORS as exc:
-            self.report_error("Open failed", f"Could not open:\n{path}\n\n{exc}")
-            return
+            if show_errors:
+                self.report_error("Open failed", f"Could not open:\n{path}\n\n{exc}")
+            return False
 
         self.loaded = loaded
-        self.current_path = path
-        self.image_paths = same_folder_images(path)
+        self.current_path = loaded.path
+        self.update_image_list_for_path(loaded.path, force=refresh_folder)
         self.setWindowTitle(f"{path.name} - {APP_NAME}")
         if self.mode == "thumbnails":
             self.populate_thumbnails()
             self.update_header()
-            return
+            self.prefetch_neighbors()
+            return True
         self.show_pixmap_for_current()
+        self.prefetch_neighbors()
+        return True
 
     def show_pixmap_for_current(self) -> None:
         if self.loaded is None:
@@ -871,8 +1179,27 @@ class PxlViewer(QMainWindow):
             current_index = 0
         if self.mode == "slideshow" and restart_slideshow:
             self.slideshow_timer.stop()
-        next_index = (current_index + direction) % len(self.image_paths)
-        self.open_path(self.image_paths[next_index])
+
+        candidate_paths = [
+            self.image_paths[(current_index + (direction * offset)) % len(self.image_paths)]
+            for offset in range(1, len(self.image_paths) + 1)
+        ]
+        opened = False
+        for next_path in candidate_paths:
+            if next_path not in self.image_paths:
+                continue
+            if self.open_path(next_path, show_errors=False):
+                opened = True
+                break
+            self.loaded_cache.pop(next_path, None)
+            self.image_paths.remove(next_path)
+            if self.image_folder == next_path.parent and not self.image_paths:
+                self.image_folder = None
+
+        if not opened:
+            self.report_error("No images", "No readable image files remain.")
+            return
+
         if self.mode == "slideshow" and restart_slideshow and not self.slideshow_paused:
             self.slideshow_timer.start()
 
@@ -887,25 +1214,34 @@ class PxlViewer(QMainWindow):
     def populate_thumbnails(self) -> None:
         if not self.image_paths:
             return
+        self.thumbnail_generation += 1
+        generation = self.thumbnail_generation
+        self.thumbnail_timer.stop()
+        self.thumbnail_queue.clear()
         self.thumbnail_grid.set_images(
             self.image_paths,
             self.current_path,
-            self.checkerboard_enabled,
         )
         self.stack.setCurrentWidget(self.thumbnail_grid)
+        QTimer.singleShot(0, lambda: self.start_thumbnail_generation(generation))
 
     def ensure_image_list(self) -> bool:
         if self.image_paths:
             return True
         if self.current_path is not None:
-            self.image_paths = same_folder_images(self.current_path)
+            self.update_image_list_for_path(self.current_path)
         return bool(self.image_paths)
 
     def reload_image(self) -> None:
         if self.current_path is None:
             return
         current_mode = self.mode
-        self.open_path(self.current_path)
+        self.loaded_cache.pop(self.current_path, None)
+        self.open_path(
+            self.current_path,
+            refresh_folder=True,
+            force_load=True,
+        )
         if current_mode == "thumbnails":
             self.show_thumbnails()
         elif current_mode == "slideshow":
@@ -1117,6 +1453,7 @@ def apply_modern_style(app: QApplication) -> None:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    configure_windows_app_identity()
 
     # Set this before QApplication is constructed so Qt can use it while
     # creating platform-native menus.
@@ -1126,12 +1463,17 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     app = QApplication([APP_NAME])
     app.setApplicationDisplayName(APP_NAME)
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     apply_modern_style(app)
     viewer = PxlViewer(
         args.target,
         initial_mode=args.mode,
         slideshow_interval=args.interval,
     )
+    if not icon.isNull():
+        viewer.setWindowIcon(icon)
     viewer.show()
     return app.exec()
 

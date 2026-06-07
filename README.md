@@ -5,7 +5,8 @@ Pillow. It opens Pillow-readable image files and directories, supports thumbnail
 browsing, zooming, transparency preview, and full-screen slideshows.
 
 The app is distributed as a single Python script with PEP 723 inline dependency
-metadata, so `uv` can install and run everything it needs.
+metadata, so `uv` can install and run everything it needs. On Windows, the
+project can build a small `pxl.exe` launcher that delegates startup to `uv`.
 
 ## Features
 
@@ -32,25 +33,35 @@ Runtime dependencies are declared inside `pxl.py`:
 
 ## Usage
 
-Run the viewer directly on Unix-like systems:
-
-```sh
-./pxl.py [image-or-directory]
-```
-
-On Windows PowerShell, use the bundled command wrapper:
+Build the Windows launcher:
 
 ```powershell
-.\pxl.cmd [image-or-directory]
+.\scripts\build-windows.ps1
 ```
 
-If the project directory is on `PATH`, you can run it as `pxl`:
+This creates `dist\pxl\pxl.exe`. Run the viewer on Windows with:
 
 ```powershell
-pxl [image-or-directory]
+.\dist\pxl\pxl.exe [image-or-directory]
 ```
 
-Or run it through `uv`:
+To also register `pxl.exe` for image files for the current Windows user:
+
+```powershell
+.\scripts\register-windows.ps1
+```
+
+You can build and register in one step:
+
+```powershell
+.\scripts\build-windows.ps1 -Register
+```
+
+The registration uses `HKCU` and does not require administrator rights. Windows
+may still ask you to choose `pxl` once from "Open with" or Default apps before
+it becomes the default image app.
+
+Run from source on any platform with:
 
 ```sh
 uv run --script pxl.py [image-or-directory]
@@ -105,9 +116,15 @@ You can also hold Ctrl and use the mouse wheel to zoom.
 
 ```text
 .
-|-- pxl.py      # Application source and inline dependency metadata
-|-- pxl.cmd     # Windows command wrapper for PowerShell and cmd.exe
-`-- README.md   # Project documentation
+|-- assets/
+|   `-- pxl.ico                    # Windows executable and app icon
+|-- scripts/
+|   |-- build-windows.ps1          # Builds dist\pxl\pxl.exe
+|   |-- create-windows-icon.ps1    # Regenerates assets\pxl.ico
+|   |-- register-windows.ps1       # Registers image file associations
+|   `-- windows_launcher.py        # Source for the small pxl.exe launcher
+|-- pxl.py                         # Application source and inline dependency metadata
+`-- README.md                      # Project documentation
 ```
 
 ## Development
