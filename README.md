@@ -6,7 +6,8 @@ browsing, zooming, transparency preview, and full-screen slideshows.
 
 The app is distributed as a single Python script with PEP 723 inline dependency
 metadata, so `uv` can install and run everything it needs. On Windows, the
-project can build a small `pxl.exe` launcher that delegates startup to `uv`.
+project can build a small native `pxl.exe` launcher that delegates startup to a
+bundled `uv.exe`.
 
 ## Features
 
@@ -33,13 +34,81 @@ Runtime dependencies are declared inside `pxl.py`:
 
 ## Usage
 
+Build the macOS app bundle:
+
+```sh
+./scripts/build-macos.sh
+```
+
+This creates `dist/Pxl.app`. The bundle contains the small Swift/AppKit
+launcher, `pxl.py`, the app icon, and a pinned `uv` binary downloaded from the
+`astral-sh/uv` GitHub release configured in `scripts/build-macos.sh`.
+
+Build the distributable macOS disk image:
+
+```sh
+./scripts/make-dmg.sh
+```
+
+This creates `dist/Pxl-0.1.0-macos.dmg` with `Pxl.app` and an `/Applications`
+symlink, plus a matching `.sha256` checksum file. Set `BUILD_APP=0` to package
+an existing `dist/Pxl.app` without rebuilding it.
+
+Run the macOS app normally:
+
+```sh
+open dist/Pxl.app
+```
+
+Open an image or directory with the macOS app:
+
+```sh
+open -a "$PWD/dist/Pxl.app" "/path/with spaces/image.png"
+```
+
+The Swift launcher is intentionally thin and runs as an `LSUIElement` helper so
+the launcher itself does not appear as a second Dock app. It receives Finder
+`openFiles` events, waits briefly on normal launch so double-click file opens do
+not also run an empty invocation, redirects output to a log, then replaces
+itself with:
+
+```sh
+Contents/Resources/uv run --gui-script Contents/Resources/pxl.py [image-or-directory]
+```
+
+Launcher output is written to `~/Library/Caches/pxl/pxl-launcher.log`. Startup
+errors before `exec` still show an `NSAlert`; after a successful `exec`, the
+Swift process no longer exists, so runtime failures should be checked in the
+log. No `.xcodeproj` is generated or managed because Swift Package Manager is
+enough for this minimal AppKit executable.
+
+Useful macOS bundle checks:
+
+```sh
+plutil -lint dist/Pxl.app/Contents/Info.plist
+codesign --verify --deep --strict --verbose=2 dist/Pxl.app
+dist/Pxl.app/Contents/Resources/uv --version
+```
+
 Build the Windows launcher:
 
 ```powershell
 .\scripts\build-windows.ps1
 ```
 
-This creates `dist\pxl\pxl.exe`. Run the viewer on Windows with:
+This creates `dist\pxl\pxl.exe`, copies `pxl.py`, and downloads a matching
+`uv.exe` from the configured `astral-sh/uv` GitHub release. The native launcher
+is built from `src\windows\launcher.c` with `cl.exe` or `clang-cl.exe`, so run
+this from a Visual Studio Developer PowerShell or another shell with a Windows C
+toolchain and resource compiler on `PATH`.
+
+You can also call the native build script directly:
+
+```powershell
+.\scripts\build-windows-native.ps1
+```
+
+Run the viewer on Windows with:
 
 ```powershell
 .\dist\pxl\pxl.exe [image-or-directory]
@@ -60,6 +129,10 @@ You can build and register in one step:
 The registration uses `HKCU` and does not require administrator rights. Windows
 may still ask you to choose `pxl` once from "Open with" or Default apps before
 it becomes the default image app.
+
+Windows launcher output is written to
+`%LOCALAPPDATA%\pxl\pxl-launcher.log`. If `pxl.py` exits with a non-zero status,
+the launcher shows a `MessageBoxW` with the log path.
 
 Run from source on any platform with:
 
@@ -117,12 +190,26 @@ You can also hold Ctrl and use the mouse wheel to zoom.
 ```text
 .
 |-- assets/
+|   |-- AppIcon.icns               # macOS app icon
 |   `-- pxl.ico                    # Windows executable and app icon
+|-- config/
+|   `-- Info.plist                 # macOS bundle metadata and file associations
+|-- Sources/
+|   `-- Pxl/
+|       `-- main.swift             # Minimal Swift/AppKit launcher
 |-- scripts/
+|   |-- build-macos.sh             # Builds dist/Pxl.app
+|   |-- build-windows-native.ps1   # Builds native dist\pxl\pxl.exe and bundles uv.exe
 |   |-- build-windows.ps1          # Builds dist\pxl\pxl.exe
+|   |-- create-macos-icon.sh       # Regenerates assets/AppIcon.icns
+|   |-- create-macos-icon.swift    # Draws and packs the macOS icon
+|   |-- make-dmg.sh                # Builds dist/Pxl-<version>-macos.dmg
 |   |-- create-windows-icon.ps1    # Regenerates assets\pxl.ico
-|   |-- register-windows.ps1       # Registers image file associations
-|   `-- windows_launcher.py        # Source for the small pxl.exe launcher
+|   `-- register-windows.ps1       # Registers image file associations
+|-- src/
+|   `-- windows/
+|       `-- launcher.c             # Minimal native Windows launcher
+|-- Package.swift                  # SwiftPM package for the macOS launcher
 |-- pxl.py                         # Application source and inline dependency metadata
 `-- README.md                      # Project documentation
 ```

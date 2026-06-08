@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import sys
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "pxl"
+APP_DISPLAY_NAME = "Pxl"
 APP_VERSION = "0.1.0"
 APP_USER_MODEL_ID = "io.github.shuic.pxl"
 DEFAULT_SLIDESHOW_INTERVAL = 3.0
@@ -195,6 +197,109 @@ def configure_windows_app_identity() -> None:
             APP_USER_MODEL_ID
         )
     except (AttributeError, OSError):
+        pass
+
+
+def configure_macos_app_identity() -> None:
+    if sys.platform != "darwin":
+        return
+
+    display_name = os.environ.get("PXL_MACOS_APP_NAME", APP_DISPLAY_NAME)
+    try:
+        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+
+        def selector(name: bytes) -> int:
+            return objc.sel_registerName(name)
+
+        def objc_class(name: bytes) -> int:
+            return objc.objc_getClass(name)
+
+        def send_id(
+            receiver: int,
+            selector_name: bytes,
+            *args: object,
+            argtypes: tuple[object, ...] = (),
+        ) -> int:
+            objc.objc_msgSend.restype = ctypes.c_void_p
+            objc.objc_msgSend.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                *argtypes,
+            ]
+            return objc.objc_msgSend(receiver, selector(selector_name), *args)
+
+        def send_bool(
+            receiver: int,
+            selector_name: bytes,
+            *args: object,
+            argtypes: tuple[object, ...] = (),
+        ) -> bool:
+            objc.objc_msgSend.restype = ctypes.c_bool
+            objc.objc_msgSend.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                *argtypes,
+            ]
+            return bool(objc.objc_msgSend(receiver, selector(selector_name), *args))
+
+        def send_void(
+            receiver: int,
+            selector_name: bytes,
+            *args: object,
+            argtypes: tuple[object, ...] = (),
+        ) -> None:
+            objc.objc_msgSend.restype = None
+            objc.objc_msgSend.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                *argtypes,
+            ]
+            objc.objc_msgSend(receiver, selector(selector_name), *args)
+
+        def nsstring(value: str) -> int:
+            return send_id(
+                objc_class(b"NSString"),
+                b"stringWithUTF8String:",
+                value.encode("utf-8"),
+                argtypes=(ctypes.c_char_p,),
+            )
+
+        ns_display_name = nsstring(display_name)
+        process_info = send_id(objc_class(b"NSProcessInfo"), b"processInfo")
+        if process_info:
+            send_void(
+                process_info,
+                b"setProcessName:",
+                ns_display_name,
+                argtypes=(ctypes.c_void_p,),
+            )
+
+        main_bundle = send_id(objc_class(b"NSBundle"), b"mainBundle")
+        info_dictionary = (
+            send_id(main_bundle, b"infoDictionary") if main_bundle else 0
+        )
+        set_object_selector = selector(b"setObject:forKey:")
+        if info_dictionary and send_bool(
+            info_dictionary,
+            b"respondsToSelector:",
+            set_object_selector,
+            argtypes=(ctypes.c_void_p,),
+        ):
+            for key in (
+                "CFBundleName",
+                "CFBundleDisplayName",
+                "CFBundleExecutable",
+            ):
+                send_void(
+                    info_dictionary,
+                    b"setObject:forKey:",
+                    ns_display_name,
+                    nsstring(key),
+                    argtypes=(ctypes.c_void_p, ctypes.c_void_p),
+                )
+    except (AttributeError, ctypes.ArgumentError, OSError, TypeError, ValueError):
         pass
 
 
@@ -1454,15 +1559,21 @@ def apply_modern_style(app: QApplication) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(list(argv if argv is not None else sys.argv[1:]))
     configure_windows_app_identity()
+    configure_macos_app_identity()
+    display_name = (
+        os.environ.get("PXL_MACOS_APP_NAME", APP_DISPLAY_NAME)
+        if sys.platform == "darwin"
+        else APP_NAME
+    )
 
     # Set this before QApplication is constructed so Qt can use it while
     # creating platform-native menus.
-    QCoreApplication.setApplicationName(APP_NAME)
+    QCoreApplication.setApplicationName(display_name)
     QCoreApplication.setApplicationVersion(APP_VERSION)
     QCoreApplication.setOrganizationName(APP_NAME)
 
-    app = QApplication([APP_NAME])
-    app.setApplicationDisplayName(APP_NAME)
+    app = QApplication([display_name])
+    app.setApplicationDisplayName(display_name)
     icon = app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
